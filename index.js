@@ -1,10 +1,14 @@
 #!/usr/bin/env node
-// # `index.js`
-// This file exposes functions for using `jdi` APIs directly, without the `jdi`
-// command line utility.
+/**
+ * # `index.js`
+ * This file exposes functions for using `jdi` APIs directly, without the `jdi`
+ * command line utility.
+ */
 'use strict' // jdi-disable-line
-// ## module dependencies
-// Native node dependencies.
+/**
+ * ## module dependencies
+ * Native node dependencies.
+ */
 const fs       = require('fs')
 const path     = require('path')
 // Dependencies used for processing the read streams of processed source files.
@@ -12,26 +16,158 @@ const split    = require('split')
 const through2 = require('through2')
 
 // ## regular expressions
-// ### `isDoc`
-// `isDoc` matches comments starting with `//`. Whitespace is being ignored.
+/**
+ * ### `isDoc`
+ * `isDoc` matches comments starting with `//`. Whitespace is being ignored.
+ */
 const isDoc = /^\s*\/\/\s*/
-// ### `isBlank`
-// `isBlank` matches lines containing only whitespace characters, such as tabs
-// or spaces.
+/**
+ * ### `isBlank`
+ * `isBlank` matches lines containing only whitespace characters, such as tabs
+ * or spaces.
+ */
 const isBlank = /^\s*$/
-// ### `isShebang`
-// `isShebang` matches lines that start with the shebang character sequence. See
-// [Shebang (Unix)](https://de.wikipedia.org/wiki/Shebang) explaining the syntax
-// of the directive itself.
+/**
+ * ### `isShebang`
+ * `isShebang` matches lines that start with the shebang character sequence. See
+ * [Shebang (Unix)](https://de.wikipedia.org/wiki/Shebang) explaining the syntax
+ * of the directive itself.
+ */
 const isShebang = /^#!/
-// ### `isIgnored`
-// `isIgnored` matches lines that end with "jdi-disable-line". This is inspired
-// by `eslint`'s `eslint-disable-line` directive.
+/**
+ * ### `isIgnored`
+ * `isIgnored` matches lines that end with "jdi-disable-line". This is inspired
+ * by `eslint`'s `eslint-disable-line` directive.
+ */
 const isIgnored = /^.*jdi-disable-line$/
+/**
+ * ### `isOption`
+ * With `isOption` option settings are introduced. They are similar to line
+ * comments but have a star right after the double slash ('//*'').
+ * Options are set by 'key value', whereby 'off', 'false' or 'no' value is
+ * seen as `false` but 'on', 'true', 'yes' or no value is seen as `true`.
+ * Options may be set also optional by block comment start tags, e.g. by
+ * using '/**'.
+ *
+ * _Added by RB_
+ */
+const isOption = /^\s*(?:(?:\/\/)|(?:\/\*))\*\s*/
+/**
+ * ### `isComment`
+ * Once the comment option is enabled, all comment lines which start with a
+ * star ('*') are filtered by removing leading whitespace, the star and following
+ * whitespace.
+ *
+ * _Added by RB_
+ */
+const isComment = /^\s*\*\s*/
+/**
+ * ### `isCommentEnd`
+ * Comment blocks may be closed by using the regular block end tag on a
+ * single line.
+ *
+ * _Added by RB_
+ */
+const isCommentEnd = /^\s*\*\/\s*$/
+/**
+ * ### `TrueOptions`
+ * Array of option values which are evaluated as `true`
+ *
+ * _Added by RB_
+ */
+const TrueOptions = ['on', 'true', 'yes']
+// +RB: Option values which are evaluated as `false`
+/**
+ * ### `FalseOptions`
+ * Array of option values which are evaluated as `false`
+ *
+ * _Added by RB_
+ */
+const FalseOptions = ['off', 'false', 'no']
+/**
+ * ### `ParseOptions`
+ * Global object to hold all current options
+ *
+ * _Added by RB_
+ */
+var ParseOptions = {}
 
 // ## `transformFunction`
 function transformFunction (chunk, enc, cb) {
 	const extname = this.options.extname
+
+	/**
+	 * ### check options setting
+	 *
+	 * So far supported options are
+	 *
+	 *   - `ignore` : once switched on, all following lines are not part of the
+	 *     output until `ignore` is switch off again
+	 *   - `nocode` : when switched on, code blocks arent part of the output
+	 *     until `nocode` is switched off again. Please note that code comments
+	 *     (see below) are still part of the output.
+	 *   - `code` : when switched on, all following comments are formatted as
+	 *     code until `code` is switched off again.
+	 *   - `comment` when switched on, all following code is formatted as
+	 *     comment until switched off again. Comments are auto detected by using
+	 *     block comment start tags with a directly following star ('/**') on a
+	 *     single line.
+   *
+	 * _Added by RB_
+	 */
+	if (isOption.test(chunk)) {
+		// remove option marker and split by whitespace
+		var keyvalue = String(chunk).replace(isOption, "").split(/\s+/)
+		// when no key is set assume it's a comment option
+		if (keyvalue.length === 0 || keyvalue[0] === '') keyvalue = ['comment', 'on'];
+    // all options are lower case
+		var key = keyvalue[0].toLowerCase()
+		if (keyvalue.length > 1) {
+			ParseOptions[key] = keyvalue.slice(1).join(" ").trim()
+			if (FalseOptions.indexOf(ParseOptions[key]) >= 0) ParseOptions[key] = false;
+			else if (TrueOptions.indexOf(ParseOptions[key]) >= 0) ParseOptions[key] = true;
+		}
+		else ParseOptions[key] = true;
+
+		// There might be the need to initialize an option once it is set.
+		// This is the right place to do that:
+		switch (key) {
+			case "nocode":
+			case "code":
+				// close a code block on ignoring following lines or when showing
+				// code comment blocks
+				if (this.isCodeBlock) {
+					this.push('```\n')
+					this.isCodeBlock = false;
+				}
+				break;
+		}
+		cb()
+		return
+	}
+	/**
+	 * ### comment block end
+	 * Block comment end tags on a single line are
+	 * switching off the comment option (when set)
+	 *
+	 * _Added by RB_
+	 */
+	if (ParseOptions.comment && isCommentEnd.test(chunk)) {
+		ParseOptions.comment = false
+		cb()
+		return
+	}
+
+	/**
+	 * ### option `ignore`
+	 * Ignore anything until `ignore` is set to false
+	 *
+	 * _Added by RB_
+	 */
+	if (ParseOptions.ignore) {
+		cb()
+		return
+	}
 
 	// ### shebang
 	// Are we currently processing the first line of the file in question?
@@ -46,7 +182,7 @@ function transformFunction (chunk, enc, cb) {
 		return
 	}
 
-	// ### blank lines 
+	// ### blank lines
 	// We ignore empty lines in order to avoid creating excessive code blocks.
 	// Empty lines are being preserved in the transformed `.md` file. They can
 	// be used for separating sections.
@@ -65,16 +201,32 @@ function transformFunction (chunk, enc, cb) {
 		return
 	}
 
-	// ### code blocks
-	// Check if we are currently in a code block. Everything that is **not** a
-	// comment can be considered to be a code block.
+	// +RB: the `isDoc` evaluation is needed several times, so let's store it.
+	this.isDoc = (isDoc.test(chunk) || ParseOptions.comment) ? true : false
+	/**
+	 * ### option nocode
+	 * Ignore code blocks when the `nocode` option is set.
+	 * _Added by RB_
+	 */
+	if (!this.isDoc && ParseOptions.nocode) {
+		cb()
+		return
+	}
+	/**
+	 * ### code blocks
+	 * Check if we are currently in a code block. Everything that is **not** a
+	 * comment can be considered to be a code block.
+	 * _Modified by RB_:
+	 * Extended by the `code` option, which could be used to include
+	 * code example comments within the documentation.
+	 */
 	const isCodeBlock = this.isCodeBlock
-	this.isCodeBlock = !isDoc.test(chunk)
-
+	this.isCodeBlock = (!this.isDoc || ParseOptions.code) ? true: false
 	// Did we just start a code block?
 	if (this.isCodeBlock && !isCodeBlock) {
-		// If yes, append ``\`\`\`${extname}` to start the code block.
-		this.push(`\`\`\`${extname}\n`)
+		// If yes, append `\`\`\`\`${extname}` to start the code block.
+		// +RB: newline added for compatibility (e.g. for CuteMarkEdit).
+		this.push(`\n\`\`\`${extname}\n`)
 	}
 
 	// Did we just close a code block?
@@ -83,15 +235,19 @@ function transformFunction (chunk, enc, cb) {
 		this.push('```\n')
 	}
 
-	// Are we currently in a code block?
-	if (this.isCodeBlock) {
-		// If yes, just pass the chunk through.
-		this.push(chunk)
-	} else {
-		// Otherwise, we're in a comment (= documentation). We remove the
+	// +RB: Are we currently in a doc block? (inversed order)
+	if (this.isDoc) {
+		// We're in a comment (= documentation). We remove the
 		// comment prefix and trailing whitespace (typically `// `).
 		// That way `// # title` becomes `# title`.
-		this.push(String(chunk).replace(isDoc, ''))
+		// +RB: Do that only, when the `comment` option isn't set,
+		// otherwise filter the whitespace and star.
+		if (ParseOptions.comment) this.push(String(chunk).replace(isComment, ''));
+		else this.push(String(chunk).replace(isDoc, ''))
+	}
+	else {
+		// Otherwise, just pass the chunk through
+		this.push(chunk)
 	}
 
 	this.push('\n')
@@ -105,7 +261,8 @@ function transformFunction (chunk, enc, cb) {
 function flushFunction (cb) {
 	// ### closing code blocks
 	// Make sure we're closing any open code blocks with `\`\`\``.
-	if (this.isCodeBlock) {
+	// +RB: support for `nocode` option added
+	if (this.isCodeBlock && (!ParseOptions.nocode)) {
 		this.push('```\n')
 	}
 
